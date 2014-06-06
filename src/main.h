@@ -1,3 +1,23 @@
+/*
+ * 	Copyright (C) 2013-2014  Lupescu Grigore, grigore.lupescu@gmail.com
+ * 	ACCAES - AES encryption on commodity hardware (CPU AESNI, GPGPU)
+ *
+ *	This file is part of ACCAES.
+ *
+ *	ACCAES is free software: you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *	the Free Software Foundation, either version 3 of the License, or
+ *	(at your option) any later version.
+ *
+ *	ACCAES is distributed in the hope that it will be useful,
+ *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *	GNU General Public License for more details.
+ *
+ *	You should have received a copy of the GNU General Public License
+ *	along with ACCAES.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 /* Common headers C */
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,16 +25,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <stdint.h>
 #include <math.h>
 #include <limits.h>
 #include <vector>
 #include <string>
 #include <memory>
+#include <unistd.h>
 
 /* OpenMP support */
 #include <omp.h>
 
 /* SSE/AES headers */
+
 #include <xmmintrin.h>
 #include <wmmintrin.h>
 #include <inttypes.h>
@@ -28,9 +51,6 @@
 
 /* OpenCL headers */
 #include "CL/cl.h"
-
-/* Verify if encryption was correct */
-#include "verify.h"
 
 using namespace std;
 
@@ -66,6 +86,9 @@ do {							\
 #define CHUNK_512MB (512* 1024* 1024)
 #define CHUNK_1024MB (1024* 1024* 1024)
 
+#define GPU_BUF_NUM			4
+#define GPU_BUF_ALLOC_SIZE	(4* CHUNK_1MB)
+
 /*******************************
 * Datatypes
 ********************************/
@@ -83,15 +106,21 @@ do {							\
 * Verfied {key, plain, cipher}
 ********************************/
 
+/* key length */
+#define AES128_KEY_LEN		16
+#define AES256_KEY_LEN		32
+
+/* chosen key length in algorithm */
+#define AES_KEY_LEN			32
+
+/* fixed key input */
 #define KEY_1				{0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,	\
 							0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f};
 
-#define PLAINTEXT_KEY_1		{0x00,0x11,0x22,0x33,0x44,0x55,0x66,	\
-							0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff};
-
-#define CYPTHERTEXT_KEY_1 	{0x8e,0xa2,0xb7,0xca,0x51,0x67,0x45,0xbf,	\
-                    			0xea,0xfc,0x49,0x90,0x4b,0x49,0x60,0x89};
-
+#define KEY_2				{0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,	\
+							0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,	\
+							0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,	\
+							0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f};
 
 /*******************************
 * Internal stuff
@@ -108,7 +137,7 @@ void io_display_hex(unsigned char* buffer, unsigned size);
 void io_display_ascii(unsigned char* buffer, unsigned size);
 
 void io_IN(unsigned char * &buf_in, unsigned char * &buf_out,
-		AES_OPTIONS aes_opt);
+		AES_OPTIONS& aes_opt);
 void io_OUT(unsigned char * &buf_in, unsigned char * &buf_out,
 		AES_OPTIONS aes_opt);
 
@@ -119,37 +148,29 @@ bool pattern_check_128(uchar* chunk, uint len, uchar* pattern);
 /*******************************
 * External stuff
 ********************************/
-/*
-void encrypt_simple_128(uchar* plain, uchar* cipher, uint len, uchar* key);
-void decrypt_simple_128(uchar* plain, uchar* cipher, uint len, uchar* key);
-
-void encrypt_hwni_128(uchar* plain, uchar* cipher, uint len, uchar* key);
-void decrypt_hwni_128(uchar* plain, uchar* cipher, uint len, uchar* key);
-
-void encrypt_gpu_128(uchar* plain, uchar* cipher, uint len, uchar* key);
-void decrypt_gpu_128(uchar* plain, uchar* cipher, uint len, uchar* key);
-*/
-
-#define KEYEXP(K, I) aes128_keyexpand(K, _mm_aeskeygenassist_si128(K, I))
-__m128i aes128_keyexpand(__m128i key, __m128i keygened);
-void key_expand(__m128i key, __m128i keyexp[]);
-void encrypt_hwni(uchar* plain, uchar* cipher, __m128i key_exp_128i[]);
-void decrypt_hwni(uchar* plain, uchar* cipher, __m128i key_exp_128i[]);
+void key128_expand(__m128i key[], __m128i keyexp[]);
+void key256_expand(__m128i key[], __m128i keyexp[]);
+void enc128_hwni(uchar* plain, uchar* cipher, __m128i key_exp_128i[]);
+void enc256_hwni(uchar* plain, uchar* cipher, __m128i key_exp_128i[]);
+void dec128_hwni(uchar* plain, uchar* cipher, __m128i key_exp_128i[]);
+void dec256_hwni(uchar* plain, uchar* cipher, __m128i key_exp_128i[]);
 
 /******************************************************
 *	STRUCT OPTIONS
 ******************************************************/
-enum ECB_CCB {ECB, CCB};
-enum Encrypt_Decrypt {ENCRYPT, DECRYPT};
+enum BLOCK_OPERATION {ECB, CTR};
 enum PROCESSOR_UNIT {CPU_HWNI, GPU, HYBRID};
 
 struct AES_OPTIONS
 {
 	/* ecb or ccb */
-	ECB_CCB ecb_ccb;
+	BLOCK_OPERATION blk_op_mode;
 
 	/* encrypt or decrypt */
-	Encrypt_Decrypt enc_dec;
+	bool encrypt;
+
+	/* one time encrypt or loop demo */
+	bool demo;
 
 	/* benchmark mode */
 	bool perf_mode;
@@ -168,8 +189,10 @@ struct AES_OPTIONS
 
 	/* CL device ids */
 	uint buf_len;
+	int cpu_count;
 	vector<uint> cl_device_ids;
 	vector<uint> cl_device_splits;
+
 };
 
 
@@ -185,10 +208,11 @@ class AES_BASE
 		uchar	*buf_out;
 		uint 	buf_len;
 		uchar	*key;
+		uint	key_len;
 
 		AES_BASE();
 		AES_BASE(uchar* chunk_in, uchar* chunk_out, uint chunk_len,
-				uchar* key, string aes_method);
+				uchar* key, uint key_len, string aes_method);
 
 		virtual void encrypt() = 0;
 		virtual void decrypt() = 0;
@@ -201,33 +225,17 @@ class AES_BASE
 class AES_HWNI : public AES_BASE
 {
 	public:
+		/* for multicore configurations */
+		int	cpu_count;
+
 		/* just store the values */
 		AES_HWNI(uchar* chunk_in, uchar* chunk_out, uint chunk_len,
-				uchar* key, string aes_method);
+				uchar* key, uint key_len, string aes_method, int cpu_count);
 
 		/*  do hardware assisted encryption - AES-NI */
 		void encrypt();
 
 		/* do hardware assisted decryption - AES-NI */
-		void decrypt();
-};
-
-
-/*******************************************************
-*	CLASS AES_SIMPLE
-*******************************************************/
-
-class AES_SIMPLE : public AES_BASE
-{
-	public:
-		/* just store the values */
-		AES_SIMPLE(uchar* chunk_in, uchar* chunk_out, uint chunk_len,
-				uchar* key, string aes_method);
-
-		/*  do simple encryption - no hw acc */
-		void encrypt();
-
-		/* do simple decryption - no hw acc */
 		void decrypt();
 };
 
@@ -249,10 +257,15 @@ struct CL_ComputeDevice
 {
 	/* CL code */
 	cl_program		dev_program;
-	cl_kernel		dev_kernel_enc_ecb;
-	cl_kernel		dev_kernel_dec_ecb;
+	cl_kernel		dev_kernel_enc128;
+	cl_kernel		dev_kernel_dec128;
+	cl_kernel		dev_kernel_enc256;
+	cl_kernel		dev_kernel_dec256;
+	cl_kernel		dev_kernel_sel;
 	cl_context		dev_context;
 	cl_command_queue dev_cmd_queue;
+	cl_command_queue dev_cmd_queue_io;
+	cl_command_queue dev_cmd_queue_iow;
 	cl_device_id	dev_id;
 	cl_platform_id	dev_platform;
 
@@ -272,21 +285,24 @@ class AES_GPU : public AES_BASE
 	cl_platform_id cl_platforms[MAX_PLATFORMS];
 
 	cl_uint cl_num_devices;
-
-	CL_ComputeDevice aes_gpu_device;
+	CL_ComputeDevice dev_gpu;
 
 	public:
-		/* just store the values */
+		/* constructor, just store the values */
 		AES_GPU(uchar* chunk_in, uchar* chunk_out, uint chunk_len,
-				uchar* key, string aes_method,
+				uchar* key, uint key_len, string aes_method,
 				cl_uint usr_device_id);
+
+		/* constructor, clear CL env */
+		~AES_GPU();
 
 		/* init gpu */
 		void init_gpu(cl_uint usr_device_id);
 
 		/*  do hardware assisted encryption - AES-NI */
 		void encrypt();
-		void encrypt_old();
+		void encrypt_overlap();
+		void encrypt_no_overlap();
 
 		/* do hardware assisted decryption - AES-NI */
 		void decrypt();
@@ -306,11 +322,12 @@ class AES_HYBRID : public AES_BASE
 		vector<uint> cl_user_ids;
 		vector<uint> cl_user_splits;
 
+		/* for multicore configurations */
 		float		gpu_work_fraction;
 
 		/* just store the values */
 		AES_HYBRID(uchar* chunk_in, uchar* chunk_out, uint chunk_len,
-				uchar* key, string aes_method, AES_OPTIONS aes_options);
+				uchar* key, uint key_len, string aes_method, AES_OPTIONS aes_options);
 
 		/*  do encryption - hw acc */
 		void encrypt();
@@ -328,7 +345,7 @@ class AES_OPENSSL : public AES_BASE
 	public:
 		/* just store the values */
 		AES_OPENSSL(uchar* chunk_in, uchar* chunk_out, uint chunk_len,
-				uchar* key, string aes_method);
+				uchar* key, uint key_len, string aes_method);
 
 		/*  do encryption - hw acc */
 		void encrypt();
@@ -363,5 +380,5 @@ class AES_PROFILER
 	public:
 		AES_PROFILER(long buf_len);
 		void start();
-		void stop();
+		void stop(const char* msg);
 };
